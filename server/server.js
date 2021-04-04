@@ -87,18 +87,20 @@
                 'Access-Control-Allow-Origin': '*',
                 'Content-Type': 'application/json'
             };
-            let result;
+            let result = '';
+            let context;
 
+            // NOTE: the OPTIONS method results in undefined result and also it never processes plugins - keep this in mind
             if (method == 'OPTIONS') {
                 Object.assign(headers, {
                     'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
                     'Access-Control-Allow-Credentials': false,
                     'Access-Control-Max-Age': '86400',
-                    'Access-Control-Allow-Headers': 'X-Requested-With, X-HTTP-Method-Override, Content-Type, Accept, X-Authorization'
+                    'Access-Control-Allow-Headers': 'X-Requested-With, X-HTTP-Method-Override, Content-Type, Accept, X-Authorization, X-Admin'
                 });
             } else {
                 try {
-                    const context = processPlugins();
+                    context = processPlugins();
                     await handle(context);
                 } catch (err) {
                     if (err instanceof ServiceError$1) {
@@ -115,6 +117,9 @@
             }
 
             res.writeHead(status, headers);
+            if (context != undefined && context.util != undefined && context.util.throttle) {
+                await new Promise(r => setTimeout(r, 500 + Math.random() * 500));
+            }
             res.end(result);
 
             function processPlugins() {
@@ -130,9 +135,9 @@
                 } else if (serviceName == 'favicon.ico') {
                     return ({ headers, result } = services['favicon'](method, tokens, query, body));
                 }
-                
+
                 const service = services[serviceName];
-                
+
                 if (service === undefined) {
                     status = 400;
                     result = composeErrorObject(400, `Service "${serviceName}" is not supported`);
@@ -141,10 +146,13 @@
                     result = await service(context, { method, tokens, query, body });
                 }
 
-                // NOTE: currently there is no scenario where result is undefined - it will either be data, or an error object;
-                // this may change with further extension of the services, so this check should stay in place
+                // NOTE: logout does not return a result
+                // in this case the content type header should be omitted, to allow checks on the client
                 if (result !== undefined) {
                     result = JSON.stringify(result);
+                } else {
+                    status = 204;
+                    delete headers['Content-Type'];
                 }
             }
         };
@@ -207,7 +215,7 @@
          * @param {{method: string, tokens: string[], query: *, body: *}} request Request parameters
          */
         async parseRequest(context, request) {
-            for (let {method, name, handler} of this._actions) {
+            for (let { method, name, handler } of this._actions) {
                 if (method === request.method && matchAndAssignParams(context, request.tokens[0], name)) {
                     return await handler(context, request.tokens.slice(1), request.query, request.body);
                 }
@@ -221,7 +229,7 @@
          * @param {(context, tokens: string[], query: *, body: *)} handler Request handler
          */
         registerAction(method, name, handler) {
-            this._actions.push({method, name, handler});
+            this._actions.push({ method, name, handler });
         }
 
         /**
@@ -252,6 +260,15 @@
         }
 
         /**
+         * Register PATCH action
+         * @param {string} name Action name. Can be a glob pattern.
+         * @param {(context, tokens: string[], query: *, body: *)} handler Request handler
+         */
+        patch(name, handler) {
+            this.registerAction('PATCH', name, handler);
+        }
+
+        /**
          * Register DELETE action
          * @param {string} name Action name. Can be a glob pattern.
          * @param {(context, tokens: string[], query: *, body: *)} handler Request handler
@@ -276,7 +293,22 @@
 
     var Service_1 = Service;
 
-    const data = fs__default['default'].readdirSync('./data').reduce((p, c) => {
+    function uuid() {
+        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
+            let r = Math.random() * 16 | 0,
+                v = c == 'x' ? r : (r & 0x3 | 0x8);
+            return v.toString(16);
+        });
+    }
+
+    var util = {
+        uuid
+    };
+
+    const uuid$1 = util.uuid;
+
+
+    const data = fs__default['default'].existsSync('./data') ? fs__default['default'].readdirSync('./data').reduce((p, c) => {
         const content = JSON.parse(fs__default['default'].readFileSync('./data/' + c));
         const collection = c.slice(0, -5);
         p[collection] = {};
@@ -284,7 +316,7 @@
             p[collection][endpoint] = content[endpoint];
         }
         return p;
-    }, {});
+    }, {}) : {};
 
     const actions = {
         get: (context, tokens, query, body) => {
@@ -310,11 +342,26 @@
                 responseData = responseData[token];
             }
 
-            const newId = uuid();
+            const newId = uuid$1();
             responseData[newId] = Object.assign({}, body, { _id: newId });
             return responseData[newId];
         },
         put: (context, tokens, query, body) => {
+            tokens = [context.params.collection, ...tokens];
+            console.log('Request body:\n', body);
+
+            let responseData = data;
+            for (let token of tokens.slice(0, -1)) {
+                if (responseData !== undefined) {
+                    responseData = responseData[token];
+                }
+            }
+            if (responseData !== undefined && responseData[tokens.slice(-1)] !== undefined) {
+                responseData[tokens.slice(-1)] = body;
+            }
+            return responseData[tokens.slice(-1)];
+        },
+        patch: (context, tokens, query, body) => {
             tokens = [context.params.collection, ...tokens];
             console.log('Request body:\n', body);
 
@@ -353,15 +400,9 @@
     dataService.get(':collection', actions.get);
     dataService.post(':collection', actions.post);
     dataService.put(':collection', actions.put);
+    dataService.patch(':collection', actions.patch);
     dataService.delete(':collection', actions.delete);
 
-    function uuid() {
-        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
-            let r = Math.random() * 16 | 0,
-                v = c == 'x' ? r : (r & 0x3 | 0x8);
-            return v.toString(16);
-        });
-    }
 
     var jsonstore = dataService.parseRequest;
 
@@ -369,12 +410,27 @@
      * This service requires storage and auth plugins
      */
 
+    const { AuthorizationError: AuthorizationError$1 } = errors;
+
+
+
     const userService = new Service_1();
 
+    userService.get('me', getSelf);
     userService.post('register', onRegister);
     userService.post('login', onLogin);
     userService.get('logout', onLogout);
-    // TODO: get user details
+
+
+    function getSelf(context, tokens, query, body) {
+        if (context.user) {
+            const result = Object.assign({}, context.user);
+            delete result.hashedPassword;
+            return result;
+        } else {
+            throw new AuthorizationError$1();
+        }
+    }
 
     function onRegister(context, tokens, query, body) {
         return context.auth.register(body);
@@ -390,18 +446,17 @@
 
     var users = userService.parseRequest;
 
-    /*
-     * This service requires storage and auth plugins
-     */
-
-    const { NotFoundError: NotFoundError$1, RequestError: RequestError$1, CredentialError: CredentialError$1, AuthorizationError: AuthorizationError$1 } = errors;
+    const { NotFoundError: NotFoundError$1, RequestError: RequestError$1 } = errors;
 
 
-    const dataService$1 = new Service_1();
-    dataService$1.get(':collection', get);
-    dataService$1.post(':collection', post);
-    dataService$1.put(':collection', put);
-    dataService$1.delete(':collection', del);
+    var crud = {
+        get,
+        post,
+        put,
+        patch,
+        delete: del
+    };
+
 
     function validateRequest(context, tokens, query) {
         /*
@@ -414,6 +469,50 @@
         }
     }
 
+    function parseWhere(query) {
+        const operators = {
+            '<=': (prop, value) => record => record[prop] <= JSON.parse(value),
+            '<': (prop, value) => record => record[prop] < JSON.parse(value),
+            '>=': (prop, value) => record => record[prop] >= JSON.parse(value),
+            '>': (prop, value) => record => record[prop] > JSON.parse(value),
+            '=': (prop, value) => record => record[prop] == JSON.parse(value),
+            ' like ': (prop, value) => record => record[prop].toLowerCase().includes(JSON.parse(value).toLowerCase()),
+            ' in ': (prop, value) => record => JSON.parse(`[${/\((.+?)\)/.exec(value)[1]}]`).includes(record[prop]),
+        };
+        const pattern = new RegExp(`^(.+?)(${Object.keys(operators).join('|')})(.+?)$`, 'i');
+
+        try {
+            let clauses = [query.trim()];
+            let check = (a, b) => b;
+            let acc = true;
+            if (query.match(/ and /gi)) {
+                // inclusive
+                clauses = query.split(/ and /gi);
+                check = (a, b) => a && b;
+                acc = true;
+            } else if (query.match(/ or /gi)) {
+                // optional
+                clauses = query.split(/ or /gi);
+                check = (a, b) => a || b;
+                acc = false;
+            }
+            clauses = clauses.map(createChecker);
+
+            return (record) => clauses
+                .map(c => c(record))
+                .reduce(check, acc);
+        } catch (err) {
+            throw new Error('Could not parse WHERE clause, check your syntax.');
+        }
+
+        function createChecker(clause) {
+            let [match, prop, operator, value] = pattern.exec(clause);
+            [prop, value] = [prop.trim(), value.trim()];
+
+            return operators[operator.toLowerCase()](prop, value);
+        }
+    }
+
 
     function get(context, tokens, query, body) {
         validateRequest(context, tokens);
@@ -422,17 +521,12 @@
 
         try {
             if (query.where) {
-                const [prop, value] = query.where.split('=');
-                responseData = context.storage.query(context.params.collection, { [prop]: JSON.parse(value) });
+                responseData = context.storage.get(context.params.collection).filter(parseWhere(query.where));
             } else if (context.params.collection) {
                 responseData = context.storage.get(context.params.collection, tokens[0]);
             } else {
                 // Get list of collections
                 return context.storage.get();
-            }
-
-            if (query.count) {
-                return responseData.length;
             }
 
             if (query.sortBy) {
@@ -442,7 +536,7 @@
                     .map(p => p.split(' ').filter(p => p != ''))
                     .map(([p, desc]) => ({ prop: p, desc: desc ? true : false }));
 
-                // Sorting priority is from first ot last, therefore we sort from last to first
+                // Sorting priority is from first to last, therefore we sort from last to first
                 for (let i = props.length - 1; i >= 0; i--) {
                     let { prop, desc } = props[i];
                     responseData.sort(({ [prop]: propA }, { [prop]: propB }) => {
@@ -462,18 +556,62 @@
             if (query.pageSize) {
                 responseData = responseData.slice(0, pageSize);
             }
+    		
+    		if (query.distinct) {
+                const props = query.distinct.split(',').filter(p => p != '');
+                responseData = Object.values(responseData.reduce((distinct, c) => {
+                    const key = props.map(p => c[p]).join('::');
+                    if (distinct.hasOwnProperty(key) == false) {
+                        distinct[key] = c;
+                    }
+                    return distinct;
+                }, {}));
+            }
+
+            if (query.count) {
+                return responseData.length;
+            }
 
             if (query.select) {
                 const props = query.select.split(',').filter(p => p != '');
-                responseData = responseData.map(r => {
+                responseData = Array.isArray(responseData) ? responseData.map(transform) : transform(responseData);
+
+                function transform(r) {
                     const result = {};
                     props.forEach(p => result[p] = r[p]);
                     return result;
+                }
+            }
+
+            if (query.load) {
+                const props = query.load.split(',').filter(p => p != '');
+                props.map(prop => {
+                    const [propName, relationTokens] = prop.split('=');
+                    const [idSource, collection] = relationTokens.split(':');
+                    console.log(`Loading related records from "${collection}" into "${propName}", joined on "_id"="${idSource}"`);
+                    const storageSource = collection == 'users' ? context.protectedStorage : context.storage;
+                    responseData = Array.isArray(responseData) ? responseData.map(transform) : transform(responseData);
+
+                    function transform(r) {
+                        const seekId = r[idSource];
+                        const related = storageSource.get(collection, seekId);
+                        delete related.hashedPassword;
+                        r[propName] = related;
+                        return r;
+                    }
                 });
             }
+
         } catch (err) {
-            throw new NotFoundError$1();
+            console.error(err);
+            if (err.message.includes('does not exist')) {
+                throw new NotFoundError$1();
+            } else {
+                throw new RequestError$1(err.message);
+            }
         }
+
+        context.canAccess(responseData);
 
         return responseData;
     }
@@ -485,14 +623,10 @@
         if (tokens.length > 0) {
             throw new RequestError$1('Use PUT to update records');
         }
+        context.canAccess(undefined, body);
 
+        body._ownerId = context.user._id;
         let responseData;
-
-        if (context.user) {
-            body._ownerId = context.user._id;
-        } else {
-            throw new AuthorizationError$1();
-        }
 
         try {
             responseData = context.storage.add(context.params.collection, body);
@@ -512,11 +646,6 @@
         }
 
         let responseData;
-
-        if (!context.user) {
-            throw new AuthorizationError$1();
-        }
-
         let existing;
 
         try {
@@ -525,12 +654,38 @@
             throw new NotFoundError$1();
         }
 
-        if (context.user._id !== existing._ownerId) {
-            throw new CredentialError$1();
-        }
+        context.canAccess(existing, body);
 
         try {
             responseData = context.storage.set(context.params.collection, tokens[0], body);
+        } catch (err) {
+            throw new RequestError$1();
+        }
+
+        return responseData;
+    }
+
+    function patch(context, tokens, query, body) {
+        console.log('Request body:\n', body);
+
+        validateRequest(context, tokens);
+        if (tokens.length != 1) {
+            throw new RequestError$1('Missing entry ID');
+        }
+
+        let responseData;
+        let existing;
+
+        try {
+            existing = context.storage.get(context.params.collection, tokens[0]);
+        } catch (err) {
+            throw new NotFoundError$1();
+        }
+
+        context.canAccess(existing, body);
+
+        try {
+            responseData = context.storage.merge(context.params.collection, tokens[0], body);
         } catch (err) {
             throw new RequestError$1();
         }
@@ -545,11 +700,6 @@
         }
 
         let responseData;
-
-        if (!context.user) {
-            throw new AuthorizationError$1();
-        }
-
         let existing;
 
         try {
@@ -558,9 +708,7 @@
             throw new NotFoundError$1();
         }
 
-        if (context.user._id !== existing._ownerId) {
-            throw new CredentialError$1();
-        }
+        context.canAccess(existing);
 
         try {
             responseData = context.storage.delete(context.params.collection, tokens[0]);
@@ -571,6 +719,16 @@
         return responseData;
     }
 
+    /*
+     * This service requires storage and auth plugins
+     */
+
+    const dataService$1 = new Service_1();
+    dataService$1.get(':collection', crud.get);
+    dataService$1.post(':collection', crud.post);
+    dataService$1.put(':collection', crud.put);
+    dataService$1.patch(':collection', crud.patch);
+    dataService$1.delete(':collection', crud.delete);
 
     var data$1 = dataService$1.parseRequest;
 
@@ -591,26 +749,66 @@
         };
     };
 
-    //const admin = require('./admin');
+    var require$$0 = "<!DOCTYPE html>\r\n<html lang=\"en\">\r\n<head>\r\n    <meta charset=\"UTF-8\">\r\n    <meta http-equiv=\"X-UA-Compatible\" content=\"IE=edge\">\r\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\r\n    <title>SUPS Admin Panel</title>\r\n    <style>\r\n        * {\r\n            padding: 0;\r\n            margin: 0;\r\n        }\r\n\r\n        body {\r\n            padding: 32px;\r\n            font-size: 16px;\r\n        }\r\n\r\n        .layout::after {\r\n            content: '';\r\n            clear: both;\r\n            display: table;\r\n        }\r\n\r\n        .col {\r\n            display: block;\r\n            float: left;\r\n        }\r\n\r\n        p {\r\n            padding: 8px 16px;\r\n        }\r\n\r\n        table {\r\n            border-collapse: collapse;\r\n        }\r\n\r\n        caption {\r\n            font-size: 120%;\r\n            text-align: left;\r\n            padding: 4px 8px;\r\n            font-weight: bold;\r\n            background-color: #ddd;\r\n        }\r\n\r\n        table, tr, th, td {\r\n            border: 1px solid #ddd;\r\n        }\r\n\r\n        th, td {\r\n            padding: 4px 8px;\r\n        }\r\n\r\n        ul {\r\n            list-style: none;\r\n        }\r\n\r\n        .collection-list a {\r\n            display: block;\r\n            width: 120px;\r\n            padding: 4px 8px;\r\n            text-decoration: none;\r\n            color: black;\r\n            background-color: #ccc;\r\n        }\r\n        .collection-list a:hover {\r\n            background-color: #ddd;\r\n        }\r\n        .collection-list a:visited {\r\n            color: black;\r\n        }\r\n    </style>\r\n    <script type=\"module\">\nimport { html, render } from 'https://unpkg.com/lit-html?module';\nimport { until } from 'https://unpkg.com/lit-html/directives/until?module';\n\nconst api = {\r\n    async get(url) {\r\n        return json(url);\r\n    },\r\n    async post(url, body) {\r\n        return json(url, {\r\n            method: 'POST',\r\n            headers: { 'Content-Type': 'application/json' },\r\n            body: JSON.stringify(body)\r\n        });\r\n    }\r\n};\r\n\r\nasync function json(url, options) {\r\n    return await (await fetch('/' + url, options)).json();\r\n}\r\n\r\nasync function getCollections() {\r\n    return api.get('data');\r\n}\r\n\r\nasync function getRecords(collection) {\r\n    return api.get('data/' + collection);\r\n}\r\n\r\nasync function getThrottling() {\r\n    return api.get('util/throttle');\r\n}\r\n\r\nasync function setThrottling(throttle) {\r\n    return api.post('util', { throttle });\r\n}\n\nasync function collectionList(onSelect) {\r\n    const collections = await getCollections();\r\n\r\n    return html`\r\n    <ul class=\"collection-list\">\r\n        ${collections.map(collectionLi)}\r\n    </ul>`;\r\n\r\n    function collectionLi(name) {\r\n        return html`<li><a href=\"javascript:void(0)\" @click=${(ev) => onSelect(ev, name)}>${name}</a></li>`;\r\n    }\r\n}\n\nasync function recordTable(collectionName) {\r\n    const records = await getRecords(collectionName);\r\n    const layout = getLayout(records);\r\n\r\n    return html`\r\n    <table>\r\n        <caption>${collectionName}</caption>\r\n        <thead>\r\n            <tr>${layout.map(f => html`<th>${f}</th>`)}</tr>\r\n        </thead>\r\n        <tbody>\r\n            ${records.map(r => recordRow(r, layout))}\r\n        </tbody>\r\n    </table>`;\r\n}\r\n\r\nfunction getLayout(records) {\r\n    const result = new Set(['_id']);\r\n    records.forEach(r => Object.keys(r).forEach(k => result.add(k)));\r\n\r\n    return [...result.keys()];\r\n}\r\n\r\nfunction recordRow(record, layout) {\r\n    return html`\r\n    <tr>\r\n        ${layout.map(f => html`<td>${JSON.stringify(record[f]) || html`<span>(missing)</span>`}</td>`)}\r\n    </tr>`;\r\n}\n\nasync function throttlePanel(display) {\r\n    const active = await getThrottling();\r\n\r\n    return html`\r\n    <p>\r\n        Request throttling: </span>${active}</span>\r\n        <button @click=${(ev) => set(ev, true)}>Enable</button>\r\n        <button @click=${(ev) => set(ev, false)}>Disable</button>\r\n    </p>`;\r\n\r\n    async function set(ev, state) {\r\n        ev.target.disabled = true;\r\n        await setThrottling(state);\r\n        display();\r\n    }\r\n}\n\n//import page from '//unpkg.com/page/page.mjs';\r\n\r\n\r\nfunction start() {\r\n    const main = document.querySelector('main');\r\n    editor(main);\r\n}\r\n\r\nasync function editor(main) {\r\n    let list = html`<div class=\"col\">Loading&hellip;</div>`;\r\n    let viewer = html`<div class=\"col\">\r\n    <p>Select collection to view records</p>\r\n</div>`;\r\n    display();\r\n\r\n    list = html`<div class=\"col\">${await collectionList(onSelect)}</div>`;\r\n    display();\r\n\r\n    async function display() {\r\n        render(html`\r\n        <section class=\"layout\">\r\n            ${until(throttlePanel(display), html`<p>Loading</p>`)}\r\n        </section>\r\n        <section class=\"layout\">\r\n            ${list}\r\n            ${viewer}\r\n        </section>`, main);\r\n    }\r\n\r\n    async function onSelect(ev, name) {\r\n        ev.preventDefault();\r\n        viewer = html`<div class=\"col\">${await recordTable(name)}</div>`;\r\n        display();\r\n    }\r\n}\r\n\r\nstart();\n\n</script>\r\n</head>\r\n<body>\r\n    <main>\r\n        Loading&hellip;\r\n    </main>\r\n</body>\r\n</html>";
+
+    const mode = process.argv[2] == '-dev' ? 'dev' : 'prod';
+
+    const files = {
+        index: mode == 'prod' ? require$$0 : fs__default['default'].readFileSync('./client/index.html', 'utf-8')
+    };
+
+    var admin = (method, tokens, query, body) => {
+        const headers = {
+            'Content-Type': 'text/html'
+        };
+        let result = '';
+
+        const resource = tokens.join('/');
+        if (resource && resource.split('.').pop() == 'js') {
+            headers['Content-Type'] = 'application/javascript';
+
+            files[resource] = files[resource] || fs__default['default'].readFileSync('./client/' + resource, 'utf-8');
+            result = files[resource];
+        } else {
+            result = files.index;
+        }
+
+        return {
+            headers,
+            result
+        };
+    };
+
+    /*
+     * This service requires util plugin
+     */
+
+    const utilService = new Service_1();
+
+    utilService.post('*', onRequest);
+    utilService.get(':service', getStatus);
+
+    function getStatus(context, tokens, query, body) {
+        return context.util[context.params.service];
+    }
+
+    function onRequest(context, tokens, query, body) {
+        Object.entries(body).forEach(([k,v]) => {
+            console.log(`${k} ${v ? 'enabled' : 'disabled'}`);
+            context.util[k] = v;
+        });
+        return '';
+    }
+
+    var util$1 = utilService.parseRequest;
 
     var services = {
         jsonstore,
         users,
         data: data$1,
         favicon,
-        //admin
-    };
-
-    function uuid$1() {
-        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
-            let r = Math.random() * 16 | 0,
-                v = c == 'x' ? r : (r & 0x3 | 0x8);
-            return v.toString(16);
-        });
-    }
-
-    var util = {
-        uuid: uuid$1
+        admin,
+        util: util$1
     };
 
     const { uuid: uuid$2 } = util;
@@ -704,13 +902,36 @@
         }
 
         /**
-         * Update entry by ID
+         * Replace entry by ID
+         * @param {string} collection Name of collection to access. Throws error if not found.
+         * @param {number|string} id ID of entry to update. Throws error if not found.
+         * @param {Object} data Value to store. Record will be replaced!
+         * @return {Object} Updated entry.
+         */
+        function set(collection, id, data) {
+            if (!collections.has(collection)) {
+                throw new ReferenceError('Collection does not exist: ' + collection);
+            }
+            const targetCollection = collections.get(collection);
+            if (!targetCollection.has(id)) {
+                throw new ReferenceError('Entry does not exist: ' + id);
+            }
+
+            const existing = targetCollection.get(id);
+            const record = assignSystemProps(deepCopy(data), existing);
+            record._updatedOn = Date.now();
+            targetCollection.set(id, record);
+            return Object.assign(deepCopy(record), { _id: id });
+        }
+
+        /**
+         * Modify entry by ID
          * @param {string} collection Name of collection to access. Throws error if not found.
          * @param {number|string} id ID of entry to update. Throws error if not found.
          * @param {Object} data Value to store. Shallow merge will be performed!
          * @return {Object} Updated entry.
          */
-        function set(collection, id, data) {
+         function merge(collection, id, data) {
             if (!collections.has(collection)) {
                 throw new ReferenceError('Collection does not exist: ' + collection);
             }
@@ -784,7 +1005,27 @@
             return result;
         }
 
-        return { get, add, set, delete: del, query };
+        return { get, add, set, merge, delete: del, query };
+    }
+
+
+    function assignSystemProps(target, entry, ...rest) {
+        const whitelist = [
+            '_id',
+            '_createdOn',
+            '_updatedOn',
+            '_ownerId'
+        ];
+        for (let prop of whitelist) {
+            if (entry.hasOwnProperty(prop)) {
+                target[prop] = deepCopy(entry[prop]);
+            }
+        }
+        if (rest.length > 0) {
+            Object.assign(target, ...rest);
+        }
+
+        return target;
     }
 
 
@@ -819,7 +1060,7 @@
 
     var storage = initPlugin;
 
-    const { ConflictError: ConflictError$1, CredentialError: CredentialError$2, RequestError: RequestError$2 } = errors;
+    const { ConflictError: ConflictError$1, CredentialError: CredentialError$1, RequestError: RequestError$2 } = errors;
 
     function initPlugin$1(settings) {
         const identity = settings.identity;
@@ -845,7 +1086,7 @@
                 if (user !== undefined) {
                     context.user = user;
                 } else {
-                    throw new CredentialError$2('Invalid access token');
+                    throw new CredentialError$1('Invalid access token');
                 }
             }
 
@@ -858,10 +1099,10 @@
                 } else if (context.protectedStorage.query('users', { [identity]: body[identity] }).length !== 0) {
                     throw new ConflictError$1(`A user with the same ${identity} already exists`);
                 } else {
-                    const newUser = {
+                    const newUser = Object.assign({}, body, {
                         [identity]: body[identity],
                         hashedPassword: hash(body.password)
-                    };
+                    });
                     const result = context.protectedStorage.add('users', newUser);
                     delete result.hashedPassword;
 
@@ -884,10 +1125,10 @@
 
                         return result;
                     } else {
-                        throw new CredentialError$2('Login or password don\'t match');
+                        throw new CredentialError$1('Login or password don\'t match');
                     }
                 } else {
-                    throw new CredentialError$2('Login or password don\'t match');
+                    throw new CredentialError$1('Login or password don\'t match');
                 }
             }
 
@@ -898,7 +1139,7 @@
                         context.protectedStorage.delete('sessions', session._id);
                     }
                 } else {
-                    throw new CredentialError$2('User session does not exist');
+                    throw new CredentialError$1('User session does not exist');
                 }
             }
 
@@ -930,6 +1171,151 @@
 
     var auth = initPlugin$1;
 
+    function initPlugin$2(settings) {
+        const util = {
+            throttle: false
+        };
+
+        return function decoreateContext(context, request) {
+            context.util = util;
+        };
+    }
+
+    var util$2 = initPlugin$2;
+
+    /*
+     * This plugin requires auth and storage plugins
+     */
+
+    const { RequestError: RequestError$3, ConflictError: ConflictError$2, CredentialError: CredentialError$2, AuthorizationError: AuthorizationError$2 } = errors;
+
+    function initPlugin$3(settings) {
+        const actions = {
+            'GET': '.read',
+            'POST': '.create',
+            'PUT': '.update',
+            'PATCH': '.update',
+            'DELETE': '.delete'
+        };
+        const rules = Object.assign({
+            '*': {
+                '.create': ['User'],
+                '.update': ['Owner'],
+                '.delete': ['Owner']
+            }
+        }, settings.rules);
+
+        return function decorateContext(context, request) {
+            // special rules (evaluated at run-time)
+            const get = (collectionName, id) => {
+                return context.storage.get(collectionName, id);
+            };
+            const isOwner = (user, object) => {
+                return user._id == object._ownerId;
+            };
+            context.rules = {
+                get,
+                isOwner
+            };
+            const isAdmin = request.headers.hasOwnProperty('x-admin');
+
+            context.canAccess = canAccess;
+
+            function canAccess(data, newData) {
+                const user = context.user;
+                const action = actions[request.method];
+                let { rule, propRules } = getRule(action, context.params.collection, data);
+
+                if (Array.isArray(rule)) {
+                    rule = checkRoles(rule, data);
+                } else if (typeof rule == 'string') {
+                    rule = !!(eval(rule));
+                }
+                if (!rule && !isAdmin) {
+                    throw new CredentialError$2();
+                }
+                propRules.map(r => applyPropRule(action, r, user, data, newData));
+            }
+
+            function applyPropRule(action, [prop, rule], user, data, newData) {
+                // NOTE: user needs to be in scope for eval to work on certain rules
+                if (typeof rule == 'string') {
+                    rule = !!eval(rule);
+                }
+
+                if (rule == false) {
+                    if (action == '.create' || action == '.update') {
+                        delete newData[prop];
+                    } else if (action == '.read') {
+                        delete data[prop];
+                    }
+                }
+            }
+
+            function checkRoles(roles, data, newData) {
+                if (roles.includes('Guest')) {
+                    return true;
+                } else if (!context.user && !isAdmin) {
+                    throw new AuthorizationError$2();
+                } else if (roles.includes('User')) {
+                    return true;
+                } else if (context.user && roles.includes('Owner')) {
+                    return context.user._id == data._ownerId;
+                } else {
+                    return false;
+                }
+            }
+        };
+
+
+
+        function getRule(action, collection, data = {}) {
+            let currentRule = ruleOrDefault(true, rules['*'][action]);
+            let propRules = [];
+
+            // Top-level rules for the collection
+            const collectionRules = rules[collection];
+            if (collectionRules !== undefined) {
+                // Top-level rule for the specific action for the collection
+                currentRule = ruleOrDefault(currentRule, collectionRules[action]);
+
+                // Prop rules
+                const allPropRules = collectionRules['*'];
+                if (allPropRules !== undefined) {
+                    propRules = ruleOrDefault(propRules, getPropRule(allPropRules, action));
+                }
+
+                // Rules by record id 
+                const recordRules = collectionRules[data._id];
+                if (recordRules !== undefined) {
+                    currentRule = ruleOrDefault(currentRule, recordRules[action]);
+                    propRules = ruleOrDefault(propRules, getPropRule(recordRules, action));
+                }
+            }
+
+            return {
+                rule: currentRule,
+                propRules
+            };
+        }
+
+        function ruleOrDefault(current, rule) {
+            return (rule === undefined || rule.length === 0) ? current : rule;
+        }
+
+        function getPropRule(record, action) {
+            const props = Object
+                .entries(record)
+                .filter(([k]) => k[0] != '.')
+                .filter(([k, v]) => v.hasOwnProperty(action))
+                .map(([k, v]) => [k, v[action]]);
+
+            return props;
+        }
+    }
+
+    var rules = initPlugin$3;
+
     var identity = "email";
     var protectedData = {
     	users: {
@@ -938,133 +1324,74 @@
     			hashedPassword: "83313014ed3e2391aa1332615d2f053cf5c1bfe05ca1cbcb5582443822df6eb1"
     		},
     		"847ec027-f659-4086-8032-5173e2f9c93a": {
-    			email: "george@abv.bg",
+    			email: "john@abv.bg",
     			hashedPassword: "83313014ed3e2391aa1332615d2f053cf5c1bfe05ca1cbcb5582443822df6eb1"
-    		},
-    		"60f0cf0b-34b0-4abd-9769-8c42f830dffc": {
-    			email: "admin@abv.bg",
-    			hashedPassword: "fac7060c3e17e6f151f247eacb2cd5ae80b8c36aedb8764e18a41bbdc16aa302"
     		}
     	},
     	sessions: {
     	}
     };
     var seedData = {
-    	recipes: {
-    		"3987279d-0ad4-4afb-8ca9-5b256ae3b298": {
-    			_ownerId: "35c62d76-8152-4626-8712-eeb96381bea8",
-    			name: "Easy Lasagna",
-    			img: "assets/lasagna.jpg",
-    			ingredients: [
-    				"1 tbsp Ingredient 1",
-    				"2 cups Ingredient 2",
-    				"500 g  Ingredient 3",
-    				"25 g Ingredient 4"
-    			],
-    			steps: [
-    				"Prepare ingredients",
-    				"Mix ingredients",
-    				"Cook until done"
-    			],
-    			_createdOn: 1613551279012
-    		},
-    		"8f414b4f-ab39-4d36-bedb-2ad69da9c830": {
-    			_ownerId: "35c62d76-8152-4626-8712-eeb96381bea8",
-    			name: "Grilled Duck Fillet",
-    			img: "assets/roast.jpg",
-    			ingredients: [
-    				"500 g  Ingredient 1",
-    				"3 tbsp Ingredient 2",
-    				"2 cups Ingredient 3"
-    			],
-    			steps: [
-    				"Prepare ingredients",
-    				"Mix ingredients",
-    				"Cook until done"
-    			],
-    			_createdOn: 1613551344360
-    		},
-    		"985d9eab-ad2e-4622-a5c8-116261fb1fd2": {
-    			_ownerId: "847ec027-f659-4086-8032-5173e2f9c93a",
-    			name: "Roast Trout",
-    			img: "assets/fish.jpg",
-    			ingredients: [
-    				"4 cups Ingredient 1",
-    				"1 tbsp Ingredient 2",
-    				"1 tbsp Ingredient 3",
-    				"750 g  Ingredient 4",
-    				"25 g Ingredient 5"
-    			],
-    			steps: [
-    				"Prepare ingredients",
-    				"Mix ingredients",
-    				"Cook until done"
-    			],
-    			_createdOn: 1613551388703
-    		}
-    	},
-    	records: {
-    		i01: {
-    			name: "John1",
-    			val: 1,
-    			_createdOn: 1613551388703
-    		},
-    		i02: {
-    			name: "John2",
-    			val: 1,
-    			_createdOn: 1613551388713
-    		},
-    		i03: {
-    			name: "John3",
-    			val: 2,
-    			_createdOn: 1613551388723
-    		},
-    		i04: {
-    			name: "John4",
-    			val: 2,
-    			_createdOn: 1613551388733
-    		},
-    		i05: {
-    			name: "John5",
-    			val: 2,
-    			_createdOn: 1613551388743
-    		},
-    		i06: {
-    			name: "John6",
-    			val: 3,
-    			_createdOn: 1613551388753
-    		},
-    		i07: {
-    			name: "John7",
-    			val: 3,
-    			_createdOn: 1613551388763
-    		},
-    		i08: {
-    			name: "John8",
-    			val: 2,
-    			_createdOn: 1613551388773
-    		},
-    		i09: {
-    			name: "John9",
-    			val: 3,
-    			_createdOn: 1613551388783
-    		},
-    		i10: {
-    			name: "John10",
-    			val: 1,
-    			_createdOn: 1613551388793
-    		}
+		wiki : {
+			"ff436770-76c5-40e2-b231-77409eda7a61":{
+				"_ownerId": "35c62d76-8152-4626-8712-eeb96381bea8",
+				"title": "Arrays",
+				"category": "JavaScript",
+				"content": "A JavaScript array is initialized with the given elements, except in the case where a single argument is passed to the Array constructor and that argument is a number (see the arrayLength parameter below). Note that this special case only applies to JavaScript arrays created with the Array constructor, not array literals created with the bracket syntax.",
+				"_createdOn": 1617194128618,
+			},
+			"1840a313-225c-416a-817a-9954d4609f7c": {
+				"_ownerId": "35c62d76-8152-4626-8712-eeb96381bea8",
+				"title": "Dictionary",
+				"category": "C#",
+				"content": "The Dictionary<TKey,TValue> generic class provides a mapping from a set of keys to a set of values. Each addition to the dictionary consists of a value and its associated key. Retrieving a value by using its key is very fast, close to O(1), because the Dictionary<TKey,TValue> class is implemented as a hash table.",
+				"_createdOn": 1617194210928,
+			},
+			"126777f5-3277-42ad-b874-76d043b069cb":{
+				"_ownerId": "35c62d76-8152-4626-8712-eeb96381bea8",
+				"title": "JDK",
+				"category": "Java",
+				"content": "The JDK is a development environment for building applications, and components using the Java programming language. The JDK includes tools useful for developing and testing programs written in the Java programming language and running on the Java platform.",
+				"_createdOn": 1617194295474,
+			},
+			"144c7f9b-8699-4f9a-946d-169c48900174":{
+				"_ownerId": "847ec027-f659-4086-8032-5173e2f9c93a",
+				"title": "Django",
+				"category": "Python",
+				"content": "Django is a high-level Python Web framework that encourages rapid development and clean pragmatic design. A Web framework is a set of components that provide a standard way to develop websites fast and easily. Django’s primary goal is to ease the creation of complex database-driven websites. Some well known sites that use Django include PBS, Instagram, Disqus, Washington Times, Bitbucket and Mozilla.",
+				"_createdOn": 1617194370545,
+			},
+			"83f379a1-8c30-4f1a-b5fd-08a9a8c7246e":{
+				"_ownerId": "847ec027-f659-4086-8032-5173e2f9c93a",
+				"title": "Objects",
+				"category": "JavaScript",
+				"content": "An object is a collection of related data and/or functionality (which usually consists of several variables and functions — which are called properties and methods when they are inside objects.) Let's work through an example to understand what they look like.",
+				"_createdOn": 1617194516642,
+			}
+		}
+    };
+    var rules$1 = {
+    	users: {
+    		".create": false,
+    		".read": [
+    			"Owner"
+    		],
+    		".update": false,
+    		".delete": false
     	}
     };
     var settings = {
     	identity: identity,
     	protectedData: protectedData,
-    	seedData: seedData
+    	seedData: seedData,
+    	rules: rules$1
     };
 
     const plugins = [
         storage(settings),
-        auth(settings)
+        auth(settings),
+        util$2(),
+        rules(settings)
     ];
 
     const server = http__default['default'].createServer(requestHandler(plugins, services));
@@ -1072,7 +1399,7 @@
     const port = 3030;
     server.listen(port);
     console.log(`Server started on port ${port}. You can make requests to http://localhost:${port}/`);
-    //console.log(`Admin panel located at http://localhost:${port}/admin`);
+    console.log(`Admin panel located at http://localhost:${port}/admin`);
 
     var softuniPracticeServer = {
 

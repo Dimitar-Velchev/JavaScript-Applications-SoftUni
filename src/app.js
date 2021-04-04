@@ -1,55 +1,57 @@
-//Тук се подготвят всички изгледи (view-controller);
-//fetch data, interpolate template,handle user input, return content/render content;
-
 import { render } from '../node_modules/lit-html/lit-html.js';
 import page from '../node_modules/page/page.mjs';
 
-
-import { dashboardPage } from './views/dashboard.js';
-import { detailsPage } from './views/details.js';
-import { createPage } from './views/create.js';
-import { editPage } from './views/edit.js';
-import { registerPage } from './views/register.js';
-import { loginPage } from './views/login.js';
-import { myPage } from './views/myFurniture.js';
-
-import { logout } from './api/api.js';
-
-const main = document.querySelector('.container');
+import { logout } from '../src/data.js'
+import { catalogPage } from '../views/catalog.js';
+import { createPage } from '../views/create.js';
+import { detailsPage } from '../views/details.js';
+import { editPage } from '../views/edit.js';
+import { homePage } from '../views/home.js';
+import { loginPage } from '../views/login.js';
+import { registerPage } from '../views/register.js';
 
 
-page('/', decorateContext, dashboardPage);
-page('/details/:id', decorateContext, detailsPage);
-page('/edit/:id', decorateContext, editPage);
-page('/create', decorateContext, createPage);
-page('/register', decorateContext, registerPage);
-page('/login', decorateContext, loginPage);
-page('/my-furniture', decorateContext, myPage);
+const main = document.getElementById('main-content');
 
+page('/home', decorateContent, homePage);
+page('/', decorateContent, homePage);
+page('/login', decorateContent, loginPage);
+page('/catalog', decorateContent, catalogPage);
+page('/create', decorateContent, createPage);
+page('/edit/:id', decorateContent, editPage);
+page('/details/:id', decorateContent, detailsPage);
+page('/register', decorateContent, registerPage);
 
 document.getElementById('logoutBtn').addEventListener('click', async () => {
     await logout();
     setUserNav();
-    page.redirect('/');
+    page.redirect('/home');
 });
 
 setUserNav();
+
 page.start();
 
-function decorateContext(ctx, next) {
+
+
+function decorateContent(ctx, next) {
     ctx.render = (content) => render(content, main);
     ctx.setUserNav = setUserNav;
     next();
-
 }
 
+
+
+
 function setUserNav() {
-    const userId = sessionStorage.getItem('userId');
-    if (userId != null) {
-        document.getElementById('user').style.display = 'inline-block';
-        document.getElementById('guest').style.display = 'none';
+
+    const email = sessionStorage.getItem('email');
+    if (email != null) {
+        document.getElementById('user').style.display = 'block'
+        document.getElementById('guest').style.display = 'none'
+
     } else {
-        document.getElementById('user').style.display = 'none';
-        document.getElementById('guest').style.display = 'inline-block';
+        document.getElementById('user').style.display = 'none'
+        document.getElementById('guest').style.display = 'block'
     }
 }
